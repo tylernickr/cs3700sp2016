@@ -1,0 +1,113 @@
+#!/usr/bin/python
+
+import socket
+import math
+import ssl
+import argparse
+import sys
+
+class NUSocket(object):
+    DEFAULT_PORT = 27993
+    bSize = 256
+    COURSE = 'cs3700spring2016'
+    
+    def __init__(self, hostname, port):
+        self.port = port
+        self.hostname = hostname
+        if self.port is None:
+            self.port = type(self).DEFAULT_PORT
+        self.socket = socket.socket()
+        
+    def connect(self):
+        self.socket.connect((self.hostname, self.port))
+        
+    def read(self):
+        return self.socket.recv(NUSocket.bSize)
+        
+    def _send(self, msg):
+        self.socket.sendall(msg)
+    
+    def sendHello(self, nuid):
+         self._send(NUSocket.COURSE + ' ' + 'HELLO' + ' ' + nuid + '\n')
+         
+    def sendAnswer(self, answer):
+        self._send(NUSocket.COURSE + ' ' + answer + '\n')
+        
+class NUSSLSocket(NUSocket):
+    DEFAULT_PORT = 27994
+
+    def __init__(self, hostname, port):
+        super(NUSSLSocket, self).__init__(hostname, port)
+        self.socket = ssl.wrap_socket(self.socket)
+        
+class ServerResponse():
+    LEGAL_TYPES = ['STATUS', 'BYE']
+    
+    def __init__(self, msg):
+        line = msg.split('\n')[0]
+        args = line.split(' ')
+        self.type = args[1]
+        self.args = args
+        if self.type.upper() not in ServerResponse.LEGAL_TYPES:
+            sys.exit("Server Response was not valid")
+            
+    def getEquation(self):
+        return NUEquation((self.args[2], self.args[3], self.args[4]))
+        
+    def getSecret(self):
+        if self.type.upper() != 'BYE':
+            raise Exception('Can not get secret from this message type.')
+        else:
+            return self.args[2]
+            
+    def getResponseType(self):
+        return self.type.upper()
+        
+    def isByeMessage(self):
+        return self.getResponseType() == 'BYE'
+            
+class NUEquation():
+    
+    def __init__(self, args):
+        self.first = int(args[0])
+        self.func = args[1]
+        self.second = int(args[2])
+        
+    def getAnswer(self):
+        if self.func == '+':
+            return str(self.first + self.second)
+        elif self.func == '-':
+            return str(self.first - self.second)
+        elif self.func == '*':
+            return str(self.first * self.second)
+        elif self.func == '/':
+            return str(int(math.floor(self.first / self.second)))
+        else:
+            sys.exit("The given equation operator is not currently supported")
+    
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument('-p', '--port_num', help='Port to connect to', type=int)
+    parser.add_argument('-s', '--ssl_encryption', help='Flag to use ssl encryption', action='store_true', default=False)
+    parser.add_argument('hostname', help='Hostname', type=str)
+    parser.add_argument('nuid', help='NUID', type=str)
+    args = parser.parse_args()
+    
+    if (args.ssl_encryption):
+        sock = NUSSLSocket(args.hostname, args.port_num)
+    else:
+        sock = NUSocket(args.hostname, args.port_num)
+    sock.connect()
+    sock.sendHello(args.nuid)
+    resp = ServerResponse(sock.read())
+    
+    while not resp.isByeMessage():
+        eq = resp.getEquation()
+        ans = eq.getAnswer()
+        sock.sendAnswer(ans)
+        resp = ServerResponse(sock.read())
+    print resp.getSecret()
+        
+if __name__ == '__main__':
+    main()
