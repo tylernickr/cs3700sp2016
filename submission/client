@@ -1,0 +1,73 @@
+#!/usr/bin/python
+
+import sys
+import socket
+import math
+import ssl
+
+# solver function
+def solve(arg1, op, arg2):
+	## assertions
+	## accepts basic binary ops (+,-,*,/) for numbers in range[0, 1000]
+	assert arg1 >= 0 and arg1 <= 1000
+	assert arg2 >= 0 and arg2 <= 1000
+	if (op == "+"):
+		return arg1 + arg2
+	elif (op == "-"):
+		return arg1 - arg2
+	elif (op == "*"):
+		return arg1 * arg2
+	elif (op == "/"):
+		return math.floor(arg1 / arg2)
+	else:
+		sys.exit("unrecognized operator " + op)
+
+
+
+## USAGE: client <-p port> <-s> [hostname] [NUID]
+arguments = sys.argv
+id = arguments[-1]
+host = arguments[-2]
+
+## check optional args
+secure = arguments[1] == "-s" or (len(arguments) > 3 and arguments[3] == "-s")
+if arguments[1] == "-p":
+	port = arguments[2]
+elif secure:
+	port = 27994
+else:
+	port = 27993
+
+connection_args = (host, port)
+
+## use secure if requested
+socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+connection = ssl.wrap_socket(socket) if secure else socket
+connection.connect(connection_args)
+
+## send HELLO
+connection.send("cs3700spring2016 HELLO " + id + "\n")
+
+## respond to STATUS messages
+solving = True 
+exit_message = ""
+while (solving):
+	message = connection.recv(256)
+	
+	# handle message
+	if "STATUS" in message:
+		header, type, arg1, operator, arg2 = message.split()
+		
+		## assertions to prevent bad message
+		assert header == "cs3700spring2016"
+		assert type == "BYE" or type == "STATUS"
+		
+		answer = solve(int(arg1), operator, int(arg2))
+		connection.send("cs3700spring2016 " + str(int(answer)) + "\n")
+	elif "BYE" in message:	
+		## exit the loop successfully
+		exit_message = message
+		solving = False;
+	else:
+		sys.exit("Error with message " + message)
+print(exit_message.split()[-1])
