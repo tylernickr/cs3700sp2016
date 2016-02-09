@@ -1,0 +1,1 @@
+For this milestone, we focused entirely on getting the simple cases to work.  The current bridge does not account for failures (i.e. no timeouts on bpdus, forwarding table entries) but it does broadcast bpdus every 500ms (or so).  Spanning tree is constructed as we discussed it in class

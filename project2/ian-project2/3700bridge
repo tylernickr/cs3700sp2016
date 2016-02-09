@@ -1,0 +1,241 @@
+#!/usr/bin/python -u    
+# The -u makes output unbuffered, so it will show up immediately
+import sys
+import socket
+import select
+import json
+import time
+
+class Bridge:
+    
+    def __init__(self, id, lans):
+        self.id = id
+        
+        ## port-related fields
+        self.ports = []
+        self.disabledPorts = []
+        self.selfLoopPorts = []
+        self.rootPort = None
+        self.rootSource = None
+        self.portMap = {}
+        
+        ## BPDU-related fields
+        self.bpdu = {
+            "cost": 0,
+            "root": self.id,
+            "nextHop": self.id 
+        }
+        self.lastSentBpduTime = 0
+        
+        ## forwarding table
+        self.forwardingTable = {}
+
+        print("Bridge " + self.id + " starting up")
+        self.pluginPorts(lans)
+        self.broadcastBpdu()
+
+    def pluginPorts(self, lans):
+        ## create a socket for every LAN and connect
+        portIndex = 0
+        for lan in lans:
+            s = socket.socket(socket.AF_UNIX, socket.SOCK_SEQPACKET)
+            s.connect(self.padLan(lan))
+            self.ports.append(s)
+            self.portMap[s] = str(portIndex) + "(" + lan + ")"
+            portIndex += 1
+
+    ## pads the name with null bytes at the end
+    def padLan(self, name):
+        result = '\0' + name
+        while len(result) < 108:
+            result += '\0'
+        return result
+
+    ## broadcast a BPDU to everyone
+    def broadcastBpdu(self):
+        self.lastSentBpduTime = time.time()
+        for port in self.ports:
+            bpdu = self.bpdu
+            bpdu['port'] = self.portMap[port] # for self-loops only
+            message = json.dumps({ "source": self.id, "dest": "ffff", "type": "bpdu", "message": json.dumps(bpdu) })
+            # print("sending bpdu on port " + self.portMap[port])    
+            port.send(message)
+
+    ########### LOG OUTPUT FUNCTIONS #############
+    def printNewRoot(self, root):
+        print("New Root: " + self.id + "/" + root)
+    
+    def printNewCost(self, cost):
+        print("New Cost: " + self.id + "/" + str(cost + 1))
+    
+    def printNewPort(self, port):
+        print("Root Port: " + self.id + "/" + port)
+    
+    def printDisabledPort(self, port):
+        print("Disabled Port: " + self.id + "/" + port)
+    
+    def printDesignatedPort(self, port):
+        print("Designated Port: " + self.id + "/" + port)
+    
+    def printBroadcastMessage(self, msg):
+        print("Broadcasting message " + msg + " to all ports")
+    
+    def printForwardedMessage(self, msg, dest):
+        print("Forwarding message " + msg + " to port " + dest)
+    
+    def printDroppedMessage(self, msg):
+        print("Not forwarding message " + msg)
+
+    def printReceivedMessage(self, msg, port, source, dest):
+        print("Received message " + msg + " on port " + port + " from " + source + " to " + dest)
+
+    ########### UPDATE FUNCTIONS    #############
+    def enablePort(self, port):
+        if not self.notDisabled(port):
+            print("Enabled Port: " + self.id + "/" + self.portMap[port])
+            self.disabledPorts.remove(port)
+    
+    def disablePort(self, port):
+        if self.notDisabled(port):
+            self.printDisabledPort(self.portMap[port])
+            self.disabledPorts.append(port)
+    
+    def foundNewRoot(self, root, cost, source, port):
+        self.printNewRoot(root)
+        self.bpdu['root'] = root
+        self.foundNewCost(cost, source, port)
+    
+    def foundNewCost(self, cost, source, port):
+        self.printNewCost(cost)
+        self.bpdu['cost'] = cost + 1
+        self.foundNewHop(source, port)
+    
+    def foundNewHop(self, source, port):
+        self.printNewPort(self.portMap[port])
+        self.bpdu['nextHop'] = source
+        self.rootPort = port
+        self.enablePort(port)
+        self.flushForwardingTable()
+        self.broadcastBpdu()
+    
+    def updateForwardingTable(self, source, who):
+        self.forwardingTable[source] = who
+    
+    def flushForwardingTable(self):
+        self.forwardingTable = {}  
+    
+    ########### PORT STATUS FUNCTIONS ############
+    def notDisabled(self, port):
+        for disabled in self.disabledPorts:
+            if self.portMap[port] == self.portMap[disabled]:
+                return False
+        return self.notSelfLoop(self.portMap[port])
+    
+    def notSelfLoop(self, port):
+        for loop in self.selfLoopPorts:
+            if loop == port:
+                return False
+        return True
+
+    ########### HANDLE DATA MESSAGES #############
+    def handleData(self, dataObj, portInc):
+        source, dest, message = dataObj['source'], dataObj['dest'], dataObj['message']
+        msgId = str(message['id'])
+        if not self.notDisabled(portInc):
+            self.printDroppedMessage(msgId)
+            return
+        
+        mappedPort = self.portMap[portInc]
+        self.updateForwardingTable(source, portInc)
+        msgString = json.dumps(dataObj)
+        self.printReceivedMessage(msgId, mappedPort, source, dest)
+        if dest == "ffff":
+            self.printBroadcastMessage(msgId)
+            for portOut in self.ports:
+                if mappedPort != self.portMap[portOut] and self.notDisabled(portOut):
+                    portOut.send(msgString)
+        else:
+            forwardingPort = self.forwardingTable.get(dest, None)
+            if forwardingPort is None:
+                self.printBroadcastMessage(msgId)
+                for portOut in self.ports:
+                    if mappedPort != self.portMap[portOut] and self.notDisabled(portOut):
+                        portOut.send(msgString)
+            elif mappedPort != self.portMap[forwardingPort]:
+                self.printForwardedMessage(msgId, dest)
+                forwardingPort.send(msgString)
+            else: # we don't need to forward message back to its sender
+                pass
+    
+    ########### HANDLE BPDU MESSAGES #############
+    def handleBpdu(self, dataObj, port):
+        bpdu = json.loads(dataObj['message'])
+        root, cost, nextHop = bpdu['root'], bpdu['cost'], bpdu['nextHop']
+        source = dataObj['source']
+        print("SELF BPDU: " + str(self.bpdu))
+        print("INCOMING: " + (str(dataObj)) + " on port " + self.portMap[port])
+        if source == self.id: ## we just received a BPDU from ourselves.  Self-loop!
+            toDisable = bpdu['port']
+            if self.notSelfLoop(toDisable): ## not already noted as a self loop
+                self.selfLoopPorts.append(toDisable)
+                self.printDisabledPort(toDisable)
+        elif self.bpdu['root'] > root: ## their root is lower, use their BPDU
+            self.foundNewRoot(root, cost, source, port)
+        elif self.bpdu['root'] < root: ## our root is lower, ignore their BPDU
+            pass
+        ## ROOTS ARE EQUIVALENT
+        elif self.bpdu['cost'] > cost + 1: ## our cost is larger than going through them, use their BPDU
+            self.foundNewCost(cost, source, port)
+        elif self.bpdu['cost'] < cost: ## their cost is larger than ours
+            if self.id == nextHop: ## they go through us, designate the port
+                self.printDesignatedPort(self.portMap[port])
+                self.enablePort(port)
+                self.flushForwardingTable()
+            else: ## they don't go through us
+                pass
+        elif self.bpdu['cost'] == cost: ## our costs are exactly equal
+            ## ignore if this is root port traffic or traffic that will directly reach the root
+            if self.portMap[port] != self.portMap[self.rootPort] and cost > 0:
+                if self.id > source: ## we have a bigger ID
+                    self.disablePort(port)
+                elif True: #self.notDisabled(port): ## they have a bigger ID and aren't from a disabled port
+                    self.printDesignatedPort(self.portMap[port])
+                    self.enablePort(port)
+                    self.flushForwardingTable()
+                else: ## the port is already disabled.  leave it be
+                    pass
+        ## SELF COST = INCOMING COST - 1
+        elif self.bpdu['nextHop'] > source: ## our next hop is larger than them, use their BPDU
+            self.foundNewHop(source, port)
+        elif self.bpdu['nextHop'] < source: ## our hop is smaller than them, disable port
+            self.disablePort(port)
+        else: ## they are our next hop
+            if self.portMap[port] == self.portMap[self.rootPort]: ## we got a BPDU from our next hop
+                pass # nothing to do
+            else: ## disable to prevent a loop
+                self.disablePort(port)
+
+    ## main method
+    def main(self):
+        while True:
+            receivers, senders, exceptional = select.select(self.ports, [], [], 0.1)
+            for port in receivers:
+                if self.notSelfLoop(self.portMap[port]):
+                    data = port.recv(1500)
+                    dataObj = json.loads(data)
+                    if dataObj['type'] == "bpdu":
+                        self.handleBpdu(dataObj, port)
+                    elif dataObj['type'] == "data":
+                        self.handleData(dataObj, port)
+                    else:
+                        pass # print("encountered bad message of type " + dataObj['type'])
+            if time.time() - self.lastSentBpduTime > 0.500:
+                self.broadcastBpdu()
+
+
+if __name__ == "__main__":
+    id = sys.argv[1]
+    lans = sys.argv[2:]
+    print("main run with id " + id + " and lans " + str(lans))
+    bridge = Bridge(id, lans)
+    bridge.main()
