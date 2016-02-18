@@ -16,18 +16,20 @@ class Bridge:
 
         ## forwarding table
         self.forwardingTable = {}
+        self.selfLoopPorts = []
 
         print("Bridge " + self.id + " starting up")
         self.pluginPorts(lans)
         self.broadcastBpdu()
 
     def setupPortFields(self):
+        print("SETUP PORT FIELDS")
         self.disabledPorts = []
         self.disabledPortsForNextHop = []
-        self.selfLoopPorts = []
         self.rootPort = None
         self.rootSource = None
         self.bridgeMap = {}
+        self.designatedPorts = []
     
     def setupBpduFields(self):
         self.bpdu = {
@@ -104,6 +106,14 @@ class Bridge:
             print("FORWARDING TABLE ENTRY: " + self.id + "/" + source + ":" + self.portMap[who])
 
     ########### UPDATE FUNCTIONS    #############
+    def designatePort(self, port):
+        self.enablePort(port)
+        if self.notDisabledForNextHop(port):
+            if self.designatedPorts.count(port) == 0:
+                self.printDesignatedPort(self.portMap[port])
+                self.designatedPorts.append(port)
+                self.flushForwardingTable()
+
     def enablePort(self, port):
         if not self.notDisabled(port) and self.notDisabledForNextHop(port):
             print("Enabled Port: " + self.id + "/" + self.portMap[port])
@@ -113,7 +123,8 @@ class Bridge:
         if self.notDisabled(port):
             self.printDisabledPort(self.portMap[port])
             self.disabledPorts.append(port)
-    
+            self.flushForwardingTable()
+
     def disablePortForNextHop(self, port):
         self.disablePort(port)
         if self.disabledPortsForNextHop.count(port) == 0:
@@ -140,7 +151,11 @@ class Bridge:
         self.broadcastBpdu()
     
     def updateForwardingTable(self, source, who, timeReceived):
-        self.forwardingTable[source] = (who, timeReceived)
+        oldWho, oldTime = self.forwardingTable.get(source, (None, None))
+        if oldTime is not None and self.portMap[who] != self.portMap[oldWho]:
+            pass
+        else:
+            self.forwardingTable[source] = (who, timeReceived)
     
     def flushForwardingTable(self):
         self.forwardingTable = {}  
@@ -185,8 +200,8 @@ class Bridge:
         msgId = str(message['id'])
         if not self.notDisabled(portInc):
             return
-        
-        self.printForwardingTable()
+        print("bridge " + self.id + " handling data from port " + self.portMap[portInc]) 
+        #self.printForwardingTable()
         mappedPort = self.portMap[portInc]
         self.updateForwardingTable(source, portInc, time.time())
         msgString = json.dumps(dataObj)
@@ -204,7 +219,7 @@ class Bridge:
                     if mappedPort != self.portMap[portOut] and self.notDisabled(portOut):
                         portOut.send(msgString)
             elif mappedPort != self.portMap[forwardingPort]:
-                self.printForwardedMessage(msgId, dest)
+                self.printForwardedMessage(msgId,self.portMap[forwardingPort])
                 forwardingPort.send(msgString)
             else: # we don't need to forward message back to its sender
                 self.printDroppedMessage(msgId)
@@ -231,9 +246,10 @@ class Bridge:
             self.foundNewCost(cost, source, port, timeNow)
         elif self.bpdu['cost'] < cost: ## their cost is larger than ours
             if self.id == nextHop: ## they go through us, designate the port
-                self.printDesignatedPort(self.portMap[port])
-                self.enablePort(port)
-                self.flushForwardingTable()
+                self.designatePort(port)
+                #self.printDesignatedPort(self.portMap[port])
+                #self.enablePort(port)
+                #self.flushForwardingTable()
             else: ## they don't go through us
                 pass
         elif self.bpdu['cost'] == cost: ## our costs are exactly equal
@@ -243,24 +259,19 @@ class Bridge:
                 if self.id > source: # our ID is bigger
                     self.disablePort(port)
                 else:
-                    self.printDesignatedPort(self.portMap[port])
-                    self.enablePort(port)
-                    self.flushForwardingTable()
-            ## ignore if this is root port traffic or traffic that will directly reach the root
-            #if self.portMap[port] != self.portMap[self.rootPort] and cost > 0:
-                #if self.id > source: ## we have a bigger ID
-                    #self.disablePort(port)
-                #elif True: #self.notDisabled(port): ## they have a bigger ID and aren't from a disabled port
+                    self.designatePort(port)
                     #self.printDesignatedPort(self.portMap[port])
                     #self.enablePort(port)
                     #self.flushForwardingTable()
-                #else: ## the port is already disabled.  leave it be
-                    #pass
+            else: # their hop isn't our next hop.  disable the port since this isn't root traffic
+                self.disablePort(port)
+
         ## SELF COST = INCOMING COST + 1
         elif self.bpdu['nextHop'] > source: ## our next hop is larger than them, use their BPDU
             self.foundNewHop(source, port, timeNow)
         elif self.bpdu['nextHop'] < source: ## our hop is smaller than them, disable port
-            self.disablePort(port)
+            if self.portMap[port] != self.portMap[self.rootPort]:
+                self.disablePort(port)
         else: ## they are our next hop
             self.lastReceivedFromNextHop = timeNow
             if self.portMap[port] == self.portMap[self.rootPort]: ## we got a BPDU from our next hop
@@ -291,6 +302,7 @@ class Bridge:
                 self.broadcastBpdu()
     
     def resetBridge(self):
+        print("RESET BRIDGE")
         self.setupPortFields()
         self.setupBpduFields()
         self.flushForwardingTable()
