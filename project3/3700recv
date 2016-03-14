@@ -1,0 +1,129 @@
+#!/usr/bin/python -u
+
+import json
+import time
+import socket
+import sys
+import datetime
+
+class Receiver:
+
+	def __init__(self):
+		## CONSTANTS
+		self.MSG_SIZE = 1500
+		self.TIMEOUT = 1.5
+
+		self.sequence = 0
+		self.lastMessage = None
+		
+		UDP_IP = "127.0.0.1"
+		UDP_PORT = 0
+
+		# Set up the socket
+		self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM) 
+		self.sock.bind((UDP_IP, UDP_PORT))
+		self.sock.settimeout(self.TIMEOUT)
+
+		# Get port we bound to
+		UDP_PORT = self.sock.getsockname()[1]
+		self.log("[bound] " + str(UDP_PORT))
+
+		## start listening
+		self.listen()
+
+	def listen(self):
+		finished = False
+		while not finished:
+			self.log('starting listen loop')
+			try:
+				self.log('entered outer try/catch')
+				result = self.sock.recvfrom(self.MSG_SIZE)
+				self.log('received result')
+				if result: # we have something to receive
+					(data, addr) = result
+					self.log('we have a result!')
+					try:
+						decoded = json.loads(data)
+						# exit if we get an eof message with the expected seq #
+						if decoded['eof'] and decoded['sequence'] == self.sequence:
+							self.log("[completed]")
+							finished = True
+						# if the message has data, accept it
+						elif decoded['data']:
+							if decoded['sequence'] == self.sequence:
+								## packet is in order
+								self.sequence += len(decoded['data'])
+								self.printReceivedData(decoded, True)
+								sys.stdout.write(decoded['data'])
+
+								## ack the packet
+								msg = json.dumps({'ack': self.sequence})
+								self.log("sending ack " + msg)
+								self.lastMessage = msg
+								if self.sock.sendto(msg, addr) < len(msg):
+									self.log("[error] unable to fully send packet")
+								else:
+									self.log("successfully sent packet")
+							else: # out of order
+								self.printReceivedData(decoded, False)
+								if decoded['sequence'] < self.sequence:
+									## we got this packet but the ack didn't go through
+									msg = json.dumps({ "ack": decoded['sequence'] + len(decoded['data']) })
+									if self.sock.sendto(msg, addr) < len(msg):
+										self.log("[error] unable to fully send packet")
+									else:
+										self.log("successfully sent packet")
+								elif self.lastMessage:
+									self.log('sending previous message')
+									self.log("sending ack " + self.lastMessage)
+									if self.sock.sendto(self.lastMessage, addr) < len(self.lastMessage):
+										self.log("[error] unable to fully send packet")
+									else:
+										self.log("successfully sent packet")
+						else:
+							self.log("no data found in message " + data)
+					except (ValueError, KeyError, TypeError) as e:
+						self.log("[recv corrupt packet]")
+					except:
+						self.log('uncaught error parsing json')
+				elif False:#self.lastMessage: # no data, but we've tried to ack before
+					self.log("no result to handle")
+					self.log('sending previous message')
+					self.log("sending ack " + self.lastMessage)
+					if self.sock.sendto(self.lastMessage, addr) < len(self.lastMessage):
+						self.log("[error] unable to fully send packet")
+					else:
+						self.log("successfully sent packet")
+			except socket.timeout as tout:
+				self.log("timeout error " + str(tout))
+				if False:#self.lastMessage:
+					self.log('sending previous message')
+					self.log("sending ack " + self.lastMessage)
+					if self.sock.sendto(self.lastMessage, addr) < len(self.lastMessage):
+						self.log("[error] unable to fully send packet")
+					else:
+						self.log("successfully sent packet")
+			except:
+				self.log("non-timeout error")
+			self.log('ending listen loop')
+		self.log('exiting')
+		sys.exit(0)
+
+
+	def log(self, string):
+		timenow = datetime.datetime.now().strftime("%H:%M:%S.%f")
+		sys.stderr.write(timenow + " " + string + "\n")
+
+	def printReceivedData(self, msg, inOrder):
+		seq = str(msg['sequence'])
+		dataLen = str(len(msg['data']))
+		endText = "(in-order)" if inOrder else "(out-of-order)"
+		self.log("[recv data] " + seq + " (" + dataLen + ") ACCEPTED " + endText)
+
+
+if __name__ == "__main__":
+    #id = sys.argv[1]
+    #lans = sys.argv[2:]
+    #print("main run with id " + id + " and lans " + str(lans))
+    receiver = Receiver()
+    receiver.listen()

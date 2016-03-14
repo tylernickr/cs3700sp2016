@@ -1,0 +1,128 @@
+#!/usr/bin/python -u
+
+import sys
+import socket
+import datetime
+import select
+import json
+import math
+
+class Sender:
+
+  def __init__(self, ip_port):
+    self.MSG_SIZE = 1500
+    self.DATA_SIZE = 1250
+    self.TIMEOUT = 1.2
+    self.UDP_IP = ip_port[0:ip_port.find(":")]
+    self.UDP_PORT = int(ip_port[ip_port.find(":")+1:])
+    self.DEST = (self.UDP_IP, self.UDP_PORT)
+
+    self.sequence = 0
+    self.cwind = 5
+    self.ssthresh = 1000000 # effectively infinite
+    self.dup_acks = 0
+    self.in_flight_packets = []
+    self.received_last_ack = False
+    self.sent_eof = False
+
+    # setup socket
+    self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    self.sock.settimeout(self.TIMEOUT)
+
+  def run(self):
+    # initial setup
+    
+    while not self.received_last_ack: # still something to do
+      self.send_next_packet()
+      self.log("Attempting to read data")
+      try:
+        result = self.sock.recvfrom(self.MSG_SIZE)
+        if result:
+          self.log("Got a result (ack)")
+          (data, addr) = result
+          try:
+            decoded = json.loads(data)
+
+            if decoded['ack'] == self.in_flight_packets[0]['seq']:
+              self.log("[recv ack] " + str(decoded['ack']))
+              self.dup_acks = 0
+              del self.in_flight_packets[0]
+              self.log("in flight: " + str(self.in_flight_packets))
+              if self.cwind > self.ssthresh:
+                self.cwind += (1 / max(1, int(math.floor(self.cwind))))
+              else:
+                self.cwind += 1
+              self.send_next_packet()
+            else: # OUT OF ORDER ACK
+              self.dup_acks += 1
+              if self.dup_acks == 3:
+                self.cwind = max(1, min(self.cwind, math.floor(self.ssthresh / 2)))
+                self.dup_acks = 0
+                self.retransmit()
+          except (ValueError, KeyError, TypeError) as e:
+            self.log("[recv corrupt packet]")
+            ## what else to do here?
+          except:
+            self.log("unexpected exception parsing json")
+            e = sys.exc_info()[0]
+            self.log(str(e))
+        else: ## no result
+          self.log("didn't receive a result")
+      except socket.timeout:
+        self.log("TIMEOUT")
+        self.ssthresh = max(1, math.floor(self.cwind / 2))
+        self.cwind = max(1, self.ssthresh)
+        self.dup_acks = 0
+        self.retransmit()
+      except:
+        self.log("unexpected exception reading from socket")
+        e = sys.exc_info()[0]
+        self.log(str(e))
+
+    self.log('[completed]')
+    sys.exit(0)
+
+  def send_next_packet(self):
+    available_packets = int(max(0, math.floor(self.cwind) - len(self.in_flight_packets)))
+    for i in range(available_packets):
+      data = sys.stdin.read(self.DATA_SIZE)
+      if len(data) > 0: ## something to send
+        msg = json.dumps({ "sequence": self.sequence, "data": data, "ack": False, "eof": False })
+        self.sequence += len(data)
+        self.in_flight_packets.append({ "seq": self.sequence, "msg": msg })
+
+        self.log("attempting to send message " + msg)
+        if self.sock.sendto(msg, self.DEST) < len(msg):
+          self.log("[error] unable to fully send packet")
+          ## now what?
+        else:
+          self.log("[send data] " + str(self.sequence) + " (" + str(len(data)) + ")")
+      elif not self.sent_eof: ## out of data, time to send eof message
+        self.log('broadcasting EOF')
+        eof_msg = json.dumps({ "eof": True, "data": "", "sequence": self.sequence, "ack": False })
+        self.in_flight_packets.append({ "seq": self.sequence + 1, "msg": eof_msg })
+        self.sock.sendto(eof_msg, self.DEST)
+        self.sent_eof = True
+      elif len(self.in_flight_packets) == 1: ## only in flight packet is eof
+          ## only in flight is eof.  we can stop
+          self.received_last_ack = True
+        
+
+  def retransmit(self):
+    self.log('RETRANSMITTING')
+    self.log("cwind = " + str(self.cwind))
+    for i in range(min(len(self.in_flight_packets), int(math.floor(self.cwind)))):
+      packet = self.in_flight_packets[i]
+      msg_as_json = json.loads(packet['msg'])
+      if self.sock.sendto(packet['msg'], self.DEST) < len(packet['msg']):
+        self.log("[error] unable to fully send packet")
+      else:
+        self.log("[send data] " + str(packet['seq']) + " (" + str(len(msg_as_json['data'])) + ")")
+
+  def log(self, string):
+    timenow = datetime.datetime.now().strftime("%H:%M:%S.%f")
+    sys.stderr.write(timenow + " " + string + "\n")
+
+if __name__ == "__main__":
+    sender = Sender(sys.argv[1])
+    sender.run()
