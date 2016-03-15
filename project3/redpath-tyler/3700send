@@ -1,0 +1,165 @@
+#!/usr/bin/python -u
+#
+# CS3700, Spring 2016
+# Project 3
+#
+
+import sys
+import socket
+import time
+import datetime
+import select
+import json
+
+MSG_SIZE = 1500
+DATA_SIZE = 1400
+TIMEOUT = 5
+SEQUENCE = 0
+
+def log(string):
+  sys.stderr.write(datetime.datetime.now().strftime("%H:%M:%S.%f") + " " + string + "\n")
+
+class Sender:
+    
+    def __init__(self):
+        self.seqNum = 0
+        self.messageCache = {}
+        
+        self.timeOfLastNewAck = time.time()
+        self.bestAckReceived = 0
+        self.failedSends = 0
+        
+        self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM) 
+        self.sock.settimeout(TIMEOUT)
+        
+        ip_port = sys.argv[1]
+        udp_ip = ip_port[0:ip_port.find(":")]
+        udp_port = int(ip_port[ip_port.find(":")+1:])
+        self.dest = (udp_ip, udp_port)
+        
+    def getDataForAck(self, ack):
+        if ack in self.messageCache:
+            return self.messageCache[ack]
+        else:
+            data = sys.stdin.read(DATA_SIZE)
+            self.messageCache[ack] = data
+            return data
+            
+    def resetAckClock(self):
+        self.timeOfLastNewAck = time.time()
+        self.failedSends = 0
+            
+    def sendPacketForSeqNum(self, seqNum, data):
+        packet = SenderPacket(seqNum, data, False, False)
+        if self.sock.sendto(packet.toSendableFormat(), self.dest) < len(packet.toSendableFormat()):
+                log("[error] unable to fully send packet")
+        else:
+            log("[send data] " + str(seqNum) + " (" + str(len(data)) + ")")
+            
+    def sendEOFPacket(self):
+        message = SenderPacket(self.seqNum, "", False, True)
+        self.sock.sendto(message.toSendableFormat(), self.dest)
+        
+    def removeOldCachedMessages(self, seqNum):
+        keysToRemove = []
+        for key in self.messageCache:
+            if key < seqNum:
+                keysToRemove.append(key)
+                
+        for key in keysToRemove:
+            del self.messageCache[key]
+        
+            
+class SenderPacket:
+    def __init__(self, seqNum, data, ack, eof):
+        self.seqNum = seqNum
+        self.data = data
+        self.ack = ack
+        self.eof = eof
+        
+    def toSendableFormat(self):
+        msg = json.dumps({"seqNum": self.seqNum, "data": self.data, "ack": self.ack, "eof": self.eof})
+        return msg
+            
+class ServerPacket:
+    def __init__(self, data):
+        decoded = json.loads(data)
+        
+        self.ack = decoded['ack']
+        
+### START OF LOGIC ###
+sender = Sender()
+data = sender.getDataForAck(0)
+sender.sendPacketForSeqNum(0, data)
+sender.sock.settimeout(TIMEOUT)
+while True:
+    try:
+        #Wait to hear something
+        result = sender.sock.recvfrom(MSG_SIZE)
+        
+        #If we hear back before timeout
+        if result:
+            (data, addr) = result
+            try:
+                response = ServerPacket(data)
+
+                # If the ack is correct or better than we were expecting
+                if response.ack > sender.bestAckReceived:
+                    log("[recv ack] " + str(response.ack))
+                    sender.bestAckReceived = response.ack
+                    
+                    data = sender.getDataForAck(response.ack)
+                    
+                    if len(data) <= 0:
+                        break
+                    #This is possibly the front of the line
+                    else:
+                        sender.removeOldCachedMessages(response.ack)
+                        nextAck = response.ack
+                        sender.sendPacketForSeqNum(nextAck, data)
+                        
+                        #Send as many packets as possible
+                        while (len(sender.messageCache) <= 1000):
+                            nextAck += len(data)
+                            data = sender.getDataForAck(nextAck)
+                            
+                            #If we reached the end, stop looping, but don't exit
+                            if len(data) <= 0:
+                                sender.resetAckClock()
+                                break
+                            else:
+                                sender.sendPacketForSeqNum(nextAck, data)
+                        if len(data) <= 0:
+                            continue
+                        sender.resetAckClock()
+                    
+            #Error handling
+            except (ValueError) as e:
+                log("[ValueError] " + str(e))
+            except (KeyError) as e:
+                log("[KeyError] " + str(e))
+            except (TypeError) as e:
+                log("[TypeError] " + str(e))
+    
+    #Didn't get any packets in expected timeframe
+    except(socket.timeout) as e:
+        #If we haven't tried enough
+        if sender.failedSends <= 10:
+            sender.failedSends += 1
+            timeToWait = .1 * (time.time() - sender.timeOfLastNewAck)
+            sender.sock.settimeout(timeToWait)
+            data = sender.getDataForAck(sender.bestAckReceived)
+            i = sender.failedSends
+            #Send multiple packets, get more and more agressive
+            while i > 0:
+                sender.sendPacketForSeqNum(sender.bestAckReceived, data)
+                i -= 1
+        
+        #We can't contact the receiver, exit
+        else:
+            log("[error] timeout")
+            sys.exit(-1)
+
+sender.sendEOFPacket()
+log("[completed]")
+sys.exit(0)
