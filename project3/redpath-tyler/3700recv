@@ -1,0 +1,118 @@
+#!/usr/bin/python -u
+#
+# CS3700, Spring 2016
+# Project 3
+#
+
+import sys
+import socket
+import time
+import datetime
+import select
+import json
+
+def log(string):
+  sys.stderr.write(datetime.datetime.now().strftime("%H:%M:%S.%f") + " " + string + "\n")
+
+class Listener:
+    MSG_SIZE = 1500
+    TIMEOUT = 30
+    UDP_IP = "127.0.0.1"
+    UDP_PORT = 0
+    
+    def __init__(self):
+        self.ack = 0
+        
+        self.messageCache = {}
+        
+        self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM) 
+        self.sock.bind((Listener.UDP_IP, Listener.UDP_PORT))
+        self.sock.settimeout(Listener.TIMEOUT)
+        
+        Listener.UDP_PORT = self.sock.getsockname()[1]
+        log("[bound] " + str(Listener.UDP_PORT))
+        
+    def isExpectedPacket(self, packet):
+        return self.ack == packet.seqNum
+        
+    def isAheadOfExpected(self, packet):
+        return self.ack < packet.seqNum
+        
+    def incrementAck(self, packet):
+        self.ack += len(packet.data)
+        
+    def resetAckAttempts(self):
+        self.ackAttempts = 0
+        
+    def sendAck(self, addr):
+        # Send back an ack to the sender
+        msg = json.dumps({"ack": self.ack})
+        log("ABOUT TO SEND " + msg)
+        if self.sock.sendto(msg, addr) < len(msg):
+            log("[error] unable to fully send packet")
+            
+    def processAllPossibleFromCache(self):
+        while self.ack in self.messageCache:
+            data = self.messageCache[self.ack]
+            sys.stdout.write(data)
+            self.ack += len(data)
+        
+
+class SenderPacket:
+    def __init__(self, incomingData):
+        decoded = json.loads(incomingData)
+        self.seqNum = decoded['seqNum']
+        self.data = decoded['data']
+        self.ack = decoded['ack']
+        self.eof = decoded['eof']
+
+### START OF LOGIC ###
+listener = Listener()
+# Now listen for packets
+while True:
+    result = listener.sock.recvfrom(Listener.MSG_SIZE)
+
+    # If nothing is ready, we hit the timeout
+    if result:
+        (data, addr) = result
+
+        try:
+            packet = SenderPacket(data)
+
+            # If the EOF flag is set, exit
+            if (packet.eof):
+                log("[completed]")
+                sys.exit(0)
+
+            # If there is data, we accept it and print it out
+            if (len(packet.data) > 0):
+      
+                log("[recv data] " + str(packet.seqNum) + " (" + str(len(packet.data)) + ") ACCEPTED")
+                
+                #If this is the packet we were expecting
+                if (listener.isExpectedPacket(packet)) :
+                    listener.incrementAck(packet)
+                    sys.stdout.write(packet.data)
+                    
+                    #Increments the ack number for us
+                    listener.processAllPossibleFromCache()
+                    listener.sendAck(addr)
+                        
+                #If they are sending packets we don't need yet
+                elif (listener.isAheadOfExpected(packet)):
+                    listener.messageCache[packet.seqNum] = packet.data
+                    listener.sendAck(addr)
+                
+                #If they send us packets we already have
+                else:
+                    #Tell them we need newer acks
+                    listener.sendAck(addr)
+
+        # Handle corrupt packets
+        except (ValueError, KeyError, TypeError) as e:
+            log("[recv corrupt packet]")
+            raise e
+    #Failed to get data, handle that        
+    else:
+        log("[error] timeout")
+        sys.exit(-1)

@@ -1,0 +1,23 @@
+The high level overview of each part of the project:
+
+Sender:
+Send a packet and wait for a response. After the first response is received (ack) then send a large
+amount of packets. Keep track of the most advanced ack's that are received and as unexpected acks
+come in such as not receiving one for a period of time or receiving one lower than expected,
+resend the packets that come after that ack.
+
+Reciever:
+Take in any packets and keep track of the ack number of the next expected packet. If any packets
+with acks bigger than expected come in, cache them to be used later. Otherwise resend an ack with the
+expected ack number.
+
+Biggest Challenge:
+The biggest challenge that we faced was getting the dropped packet handling to be consistent.
+Especially at higher drop rates, it took quite awhile to get the code working the way we wanted.
+High latency was also an issue (the last basic test). These two issues were probably both related to
+the same problems with resending packets.
+
+Testing:
+We tested our code primarily with the test and run scripts, specifying each area (drops, dups, delay) at a time
+with run and then eventually moving to the test script. We also used debug statements in our code to help used
+figure out what was going on.
