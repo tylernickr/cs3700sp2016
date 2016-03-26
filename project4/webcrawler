@@ -18,12 +18,13 @@ class Crawler:
 		self.SESSION_COOKIE = ""
 
 		self.HOST_HEADER = "Host: " + self.BASE_URL + "\r\n"
-		self.CONN_HEADER = "Connection: keep-alive\r\n"
+		self.CONN_HEADER = "Connection: close\r\n"
 		self.TYPE_HEADER = 'Content-Type: application/x-www-form-urlencoded\r\n'
 		self.SPACER = '\r\n'
 
 		self.html_page = ""	
 		self.links_to_crawl = []
+		self.crawled = []
 		self.secret_flags = []
 
 	def run(self):
@@ -67,6 +68,7 @@ class Crawler:
 			link = self.links_to_crawl[0]
 			self.processLink(link)
 			self.links_to_crawl.pop(0)
+			self.crawled.append(link)
 
 		self.sock.close()
 		print(self.secret_flags)
@@ -104,15 +106,15 @@ class Crawler:
 		self.SESSION_COOKIE = re.search(r'Set-Cookie: sessionid=(.*); expires', self.html_page).group(1)
 
 	def checkForFlags(self):
-		flag_matches = re.search(r"<h2 class='secret_flag' style=\"color:red\">FLAG: (.*)</h2>", self.html_page)
+		flag_matches = re.search(r"<h2 class='secret_flag' style=\"color:red\">FLAG: ([a-zA-Z0-9]{64})</h2>", self.html_page)
 		if flag_matches:
-			self.secret_flag.push(flag_matches.group(1))
+			self.secret_flags.append(flag_matches.group(1))
 			print('FOUND SECRED FLAG ON PAGE ' + self.html_page)
 
 	def findLinks(self):
 		links = re.findall(r'href=\"(\/fakebook\/\S+\/)\"', self.html_page)
 		#print(links)
-		self.links_to_crawl += [x for x in links if x not in self.links_to_crawl]
+		self.links_to_crawl += [x for x in links if x not in self.links_to_crawl and x not in self.crawled]
 
 	def getRequestLine(self, type, path):
 		return type + " " + path + ' HTTP/1.1\r\n'
@@ -129,6 +131,7 @@ class Crawler:
 	def create_socket(self):
 		self.sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
 		self.sock.connect((self.BASE_URL, self.HTML_PORT))
+		self.sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
 
 if __name__ == "__main__":
 	crawler = Crawler(sys.argv[1:3])
