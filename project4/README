@@ -1,0 +1,13 @@
+*** High Level Approach ***
+For our crawler, we login using http posts and requests, storing session information.
+Once we are logged in, scan the page for any links and secret flags.
+Add any secret flags to the list and add any links that we found that we haven't already tried to the queue.
+Keep going until we either find 5 secret flags or until we run out of links to traverse.
+
+*** Problems ***
+One of the problems that we had was getting the script to login programatically
+We also faced a looping issue where if link loops were large enough, we would miss them
+Lastly we faced some issues when setting up threading with resource allocation
+
+*** Testing ***
+We tested the script primarily by running it on fakebook and used debugging messages and the chrome debugger
