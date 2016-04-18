@@ -17,42 +17,56 @@ class KVStore:
         self.db = {}
         self.leader = 'FFFF'
         
+        self.staged_pair = None
+        
         self.term = 0
+        
         self.commits = 0
+        self.log = []
         
         self.last_heartbeat = time.time()
         self.leader_timeout = .3
         
+        self.messageQueue = []
+        
         self.num_replicas = len(replica_ids) + 1
         
-        self.state = 'follower'
         
         self.sock = socket.socket(socket.AF_UNIX, socket.SOCK_SEQPACKET)
         self.sock.connect(self.id)
         
-    def redirect_to_leader(self, msg):
-        to_send = {'src': self.id, 'dst': msg['src'], 'MID': msg['MID'],  'type': 'redirect', 'leader': self.leader}
+    def redirect_message_to_leader(self, msg):
+        to_send = {'src': self.id, 'dst': msg['src'], 'MID': msg['MID'], 'type': 'redirect', 'leader': self.leader}
         self.sock.send(json.dumps(to_send))
-                    
-    def send_put_to_replicas(self, msg):
-        to_send = {'src': self.id, 'dst': 'FFFF', 'type': msg['type'], 'leader': self.id, 'key': msg['key'], 'value': msg['value'], 'MID': msg['MID']}
-        self.sock.send(json.dumps(to_send))
-        
-    def send_put_response(self, msg):
-        to_send = {'src': self.id, 'dst': msg['src'], 'leader': self.leader, 'type': 'ok', 'MID': msg['MID']}
-        self.sock.send(json.dumps(to_send))
-        #print self.id + ": finished sending response to: " + to_send['dst']
-        
-    def send_get_response(self, msg, value):
-        to_send = {'src': self.id, 'dst': msg['src'], 'leader': self.leader, 'type': 'ok', 'MID': msg['MID'], 'value':value}
-        self.sock.send(json.dumps(to_send))
+        print self.id + ": sending redirect"
         
     def send_failed_response(self, msg):
         to_send = {'src': self.id, 'dst': msg['src'], 'leader': self.leader, 'type': 'fail', 'MID': msg['MID']}
-        self.sock.send(json.dumps(msg))
+        self.sock.send(json.dumps(to_send))
+        
+    def send_success_response(self, msg):
+        to_send = {'src': self.id, 'dst': msg['src'], 'leader': self.leader, 'type': 'ok', 'MID': msg['MID']}
+        self.sock.send(json.dumps(to_send))
+        
+    def send_get_response(self, msg, value):
+        to_send = {'src': self.id, 'dst': msg['src'], 'leader': self.leader, 'type': 'ok', 'MID': msg['MID'], 'value': value}
+        self.sock.send(json.dumps(to_send)) 
         
     def send_RPC(self):
-        msg = {'src': self.id, 'dst': 'FFFF', 'leader': self.leader, 'type': 'rpc', 'term': self.term}
+        msg = {'src': self.id, 'dst': 'FFFF', 'leader': self.leader, 'type': 'rpc', 'term': self.term, 'commits': self.commits}
+        self.sock.send(json.dumps(msg))
+        
+    def send_staging_broadcast(self, key, value):
+        to_send = {'key': key, 'value': value, 'src': self.id, 'dst': 'FFFF', 'leader': self.leader, 'type': 'stage', 'term': self.term, 'commits': self.commits}
+        self.sock.send(json.dumps(to_send))
+        print "broadcasted"
+        
+    def send_promise(self, msg):
+        to_send = {'src': self.id, 'dst': msg['src'], 'leader': self.leader, 'type': 'promise'}
+        self.sock.send(json.dumps(to_send))
+        
+    def send_commit_broadcast(self, key, value):
+        to_send = {'key': key, 'value': value, 'src': self.id, 'dst': 'FFFF', 'leader': self.leader, 'type': 'commit', 'term': self.term, 'commits': self.commits}
         self.sock.send(json.dumps(msg))
         
     def send_vote(self, dest):
@@ -61,9 +75,8 @@ class KVStore:
         
     def begin_election(self):
         self.leader_timeout = 2
-        #print self.id + ": is trying to be leader"
+        print self.id + ": is trying to be leader"
         self.leader = 'FFFF'
-        self.state = 'candidate'
         self.term += 1
         self.send_RPC()
         time_of_last_rpc = time.time()
@@ -77,7 +90,7 @@ class KVStore:
             
             if time.time() - election_start > election_timeout:
                 #timed out, abort election
-                self.state = 'follower'
+                print self.id + ": lost the election"
                 self.last_heartbeat = time.time()
                 return
                 
@@ -111,11 +124,8 @@ class KVStore:
                         
         #after winning the election
         self.leader = self.id
-        self.state = 'leader'
         self.send_RPC()
         print self.id + " JUST WON THE ELECTION"
-        #for vote in votes:
-           # print vote
         
     def vote_in_election(self, candidate_id):
         self.leader_timeout = 2
@@ -157,26 +167,83 @@ class KVStore:
         #after the election is over
         self.leader = msg['leader']
         
-        
     def time_to_elect_new_leader(self):
         return time.time() - self.last_heartbeat > self.leader_timeout and not self.id == self.leader
-    
-    def get(self, key):
-        if key in self.db:
-            #print self.id + ": got (" + key + ", " + self.db[key] + ")"
-            return self.db[key]
-        else:
-            return ""
-        
-    def put(self, key, value):
-        self.db[key] = value
-        self.commits += 1
-        #print self.id + ": put (" + key + ", " + value + ")"
         
     def is_leader(self):
         return self.id == self.leader
         
+    def get(self, key):
+        value = self.db[key]
+        return value 
+        
+    def put(self, key, value):
+        try:
+            self.stage(key, value)
+            self.stage_replicas(key, value)
+        except Exception as e:
+            print e
+            self.staged_pair = None
+            raise Exception("Timeout stage")
 
+        try:
+            self.commit()
+            self.commit_replicas(key, value)
+        except Exception as e:
+            print e
+            raise Exception("Timeout commit")
+            
+    def commit_replicas(self, key, value):
+        self.send_commit_broadcast(key, value)
+    
+    def commit(self):
+        key, value = self.staged_pair
+        self.db[key] = value
+        self.log.append((key, value))
+        self.staged_pair = None
+        
+    def stage(self, key, value):
+        self.staged_pair = (key, value)
+    
+    def stage_replicas(self, key, value):
+        responded = [self.id]
+        time_of_last_send = time.time()
+        time_of_firt_send = time.time()
+        self.send_staging_broadcast(key, value)
+        while len(responded) < math.ceil(self.num_replicas / 2.0):
+            
+            if time.time() - time_of_firt_send > .4:
+                raise Exception("Timeout on staging")
+            
+            if time.time() - time_of_last_send > .5:
+                time_of_last_send = time.time()
+                self.send_staging_broadcast(key, value)
+                
+            ready = select.select([self.sock], [], [], 0.1)[0]
+            if self.sock in ready:
+                msg_raw = self.sock.recv(32768)
+                
+                if len(msg_raw) == 0:
+                    continue
+                
+                msg = json.loads(msg_raw)
+                
+                #Handle GET and PUT()
+                if msg['type'] in ['put', 'get']:
+                    self.send_failed_response(msg)
+                    
+                #Handle response
+                elif msg['type'] == 'promise':
+                    if msg['src'] not in responded:
+                        responded.append(msg['src'])
+                        
+                else:
+                    print "Something unexpected happened"
+                    
+                
+            
+
+#########START OF MAIN###########
 kvstore = KVStore(my_id)
 time.sleep(.5)
 kvstore.last_heartbeat = time.time()
@@ -189,6 +256,7 @@ while True:
     ready = select.select([kvstore.sock], [], [], 0.1)[0]
     
     if kvstore.sock in ready:
+    
         msg_raw = kvstore.sock.recv(32768)
         
         if len(msg_raw) == 0: 
@@ -196,28 +264,50 @@ while True:
             
         msg = json.loads(msg_raw)
         
-        # For now, ignore get() and put() from clients
+        #Handle GET()
         if msg['type'] == 'get':
             if kvstore.is_leader():
-                value = kvstore.get(msg['key'])
+                key = msg['key']
+                try:
+                    value = kvstore.get(key)
+                except Exception as e:
+                    print e
+                    
                 kvstore.send_get_response(msg, value)
             else:
-                kvstore.redirect_to_leader(msg)
+                kvstore.redirect_message_to_leader(msg)
         
+        #Handle PUT()
         elif msg['type'] == 'put':
-            if msg['src'] == kvstore.id:
-                pass
-                
             if kvstore.is_leader():
-                kvstore.put(msg['key'], msg['value'])
-                #print "leader put msg: " + msg['MID'] + " sent from: " + msg['src']
-                kvstore.send_put_to_replicas(msg)
-                kvstore.send_put_response(msg)
+                key = msg['key']
+                value = msg['value']
+                try:
+                    kvstore.put(key, value)
+                    kvstore.send_success_response(msg)
+                except Exception as e:
+                    print e
+                    print kvstore.id + ": Timeout Error"
+                    kvstore.send_failed_response(msg)
             else:
-                kvstore.redirect_to_leader(msg)
+                kvstore.redirect_message_to_leader(msg)
+                
+        
+        #Handle STAGE
+        elif msg['type'] == 'stage':
+            kvstore.stage(msg['key'], msg['value'])
+            kvstore.send_promise(msg)
+            continue
+            
+        #Handle COMMIT
+        elif msg['type'] == 'commit':
+            #This is weird and shouldn't happen unless we missed a promise, handle anyway
+            kvstore.stage(msg['key'], msg['value'])
+            kvstore.commit()
+            continue
                     
-            
-            
+        
+        #Handle RPC
         elif msg['type'] == 'rpc':
             if msg['leader'] == msg['src']:
                 #this person claims to have won an election
