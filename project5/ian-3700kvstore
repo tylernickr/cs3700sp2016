@@ -1,0 +1,356 @@
+#!/usr/bin/env python
+
+import json, math, random, select, socket, sys, time
+
+class Server:
+
+	def __init__(self, args):
+		self.db = {}
+		self.log = []
+		self.prevLogIndexMap = {}
+		self.matchIndexMap = {}
+
+		self.commitIndex = 0
+		self.lastApplied = 0
+
+		self.currentTerm = 0
+		self.votedFor = None
+		self.votes = []
+		self.leader = 'FFFF'
+
+		self.ID = args[0]
+		self.state = 'follower'
+		self.peers = args[1:]
+		self.num_machines = len(self.peers) + 1
+
+		for peer in self.peers:
+			self.prevLogIndexMap[peer] = 0
+
+		self.last_sent_heartbeat = 0
+		self.last_received_heartbeat = 0
+		self.election_start = 0
+
+		self.election_timer = (random.random() * 0.4) + 0.7
+		self.leader_timer = 0.5
+		self.heartbeat_timeout = 0.35
+
+		self.sock = socket.socket(socket.AF_UNIX, socket.SOCK_SEQPACKET)
+		self.sock.connect(self.ID)
+
+	def send_append_entries(self, dst):
+		msg = {}
+		msg['dst'] = dst
+		msg['src'] = self.ID
+		msg['leader'] = self.ID ## only send this if you're the leader
+		msg['type'] = 'append_entries'
+
+		msg['term'] = self.currentTerm
+		msg['prevLogIndex'] = self.prevLogIndexFor(dst)
+		msg['prevLogTerm'] = self.log[self.prevLogIndexFor(dst)]
+		msg['entries'] = self.log[self.prevLogIndexFor(dst)+1:]
+		msg['leaderCommit'] = self.commitIndex
+
+		self.sock.send(json.dumps(msg))
+
+	def send_heartbeat(self, dst):
+		msg = {}
+		msg['dst'] = dst
+		msg['src'] = self.ID
+		msg['leader'] = self.ID ## only send this if you're the leader
+		msg['type'] = 'append_entries'
+
+		msg['term'] = self.currentTerm
+		msg['prevLogIndex'] = self.prevLogIndexFor(dst)
+		if self.prevLogIndexFor(dst) > 0:
+			msg['prevLogTerm'] = self.log[self.prevLogIndexFor(dst)]
+		else:
+			msg['prevLogTerm'] = None
+		msg['entries'] = []
+		msg['leaderCommit'] = self.commitIndex
+
+		self.sock.send(json.dumps(msg))
+
+	def processAppendEntries(self, msg):
+		resp = {}
+		resp['dst'] = msg['src']
+		resp['src'] = self.ID
+		resp['type'] = 'append_entries_resp'
+		if msg['term'] < self.currentTerm:
+			resp['result'] = False
+			resp['term'] = self.term
+			resp['leader'] = self.leader
+		else:
+			self.leader = msg['src']
+			resp['leader'] = self.leader
+			self.term = msg['term']
+			resp['term'] = self.term
+			resp['result'] = self.processLogs(msg)
+
+		self.sock.send(json.dumps(resp))
+
+	def processLogs(self, msg):
+		index = msg['prevLogIndex']
+		term = msg['prevLogTerm']
+		my_term = None if index >= len(self.log) or index < 0 else self.log[index]
+		if my_term != term:
+			return False
+		else:
+			self.log = self.log[:index+1] + msg['entries']
+			if msg['leaderCommit'] > self.commitIndex:
+				oldIndex = self.commitIndex
+				self.commitIndex = math.min(msg['leaderCommit'], len(self.log) - 1)
+				for i in range(oldIndex, self.commitIndex + 1):
+					self.commit(self.log[index])
+			return True
+
+	def commit(self, tup):
+		(term, key, value) = tup
+		self.db[key] = value
+
+	def prevLogIndexFor(self, dest):
+		return self.prevLogIndexMap[dest]
+
+	def send_request_vote(self, dest):
+		msg = {}
+		msg['src'] = self.ID
+		msg['dst'] = dest
+		msg['leader'] = 'FFFF' ## may just be an ignored value instead
+		msg['type'] = 'request_vote'
+
+		msg['term'] = self.currentTerm
+		msg['lastLogIndex'] = len(self.log)
+		if len(self.log) > 0:
+			(term, key, value) = self.log[len(self.log) - 1]
+			msg['lastLogTerm'] = term
+
+		self.sock.send(json.dumps(msg))
+
+	def winElection(self):
+		self.state = 'leader'
+		self.last_sent_heartbeat = time.time()
+		for peer in self.peers:
+			self.prevLogIndexMap[peer] = len(self.log) - 1
+			self.send_heartbeat(peer)
+
+	def process_request_vote(self, msg):
+		resp = {}
+		resp['src'] = self.ID
+		resp['dst'] = msg['src']
+		resp['leader'] = 'FFFF' ## may just be an ignored value instead
+		resp['type'] = 'request_vote_resp'
+
+		if msg['term'] < self.currentTerm:
+			resp['term'] = self.currentTerm
+			resp['vote_granted'] = False
+		else:
+			self.currentTerm = msg['term']
+			resp['term'] = self.currentTerm
+			if self.votedFor is None or self.votedFor == resp['src']:
+				if len(self.log) == 0:
+					self.votedFor = msg['src']
+					resp['vote_granted'] = True
+				else:
+					latest_tuple = self.log[-1]
+					(term, key, value) = latest_tuple
+					if term < msg['term']:
+						self.votedFor = msg['src']
+						resp['vote_granted'] = True
+					elif term > msg['term']:
+						resp['vote_granted'] = False
+					elif len(self.log) > msg['lastLogIndex']:
+						resp['vote_granted'] = False
+					else:
+						self.votedFor = msg['src']
+						resp['vote_granted'] = True
+			else:
+				resp['vote_granted'] = False	
+		self.sock.send(json.dumps(resp))
+
+	def receive_request_vote_resp(self, msg):
+		new_vote = msg['vote_granted']
+		peer_term = msg['term']
+		if new_vote:
+			if msg['src'] not in self.votes:
+				self.votes.append(msg['src'])
+				if len(self.votes) > (len(self.peers) / 2.0):
+					## we've been elected!
+					self.winElection()
+		else:
+			## either we're behind, or they voted for someone else
+			if msg['term'] > self.currentTerm:
+				## I don't know what to do here
+				pass
+
+	def receive_append_entries_resp(self, msg):
+		success = msg['result']
+		peer_term = msg['term']
+		if success:
+			self.prevLogIndexMap[msg['src']] = len(self.log) - 1
+		else:
+			## mismatch or bad term
+			if peer_term == self.currentTerm:
+				self.prevLogIndexFor[msg['src']] -= 1
+				self.send_append_entries(msg['src'])
+			else:
+				## they have a newer term.  what happens here?
+				pass
+
+	def get(self, key):
+		if key in self.db:
+			return self.db[key]
+		else:
+			return ""
+
+	def send_redirect_response(self, msg):
+		resp = {}
+		resp['src'] = self.ID
+		resp['dst'] = msg['src']
+		resp['leader'] = self.leader
+		resp['MID'] = msg['MID']
+		resp['type'] = 'redirect'
+		
+		self.sock.send(json.dumps(resp))
+
+	def send_get_response(self, msg):
+		resp = {}
+		resp['src'] = self.ID
+		resp['dst'] = msg['src']
+		resp['leader'] = self.leader
+		resp['MID'] = msg['MID']
+		resp['type'] = 'ok'
+		resp['value'] = self.get(msg['key'])
+		
+		self.sock.send(json.dumps(resp))
+
+	def send_failure_response(self, msg):
+		resp = {}
+		resp['src'] = self.ID
+		resp['dst'] = msg['src']
+		resp['leader'] = self.leader
+		resp['MID'] = msg['MID']
+		resp['type'] = 'fail'
+		
+		self.sock.send(json.dumps(resp))
+
+	def send_put_response(self, msg):
+		resp = {}
+		resp['src'] = self.ID
+		resp['dst'] = msg['src']
+		resp['leader'] = self.leader
+		resp['MID'] = msg['MID']
+		resp['type'] = 'ok'
+		
+		self.sock.send(json.dumps(resp))
+
+	def isState(self, state):
+		return self.state == state
+
+	def handleGet(self, msg):
+		if self.isState('leader'):
+			self.send_get_response(msg)
+		elif self.isState('candidate'):
+			self.send_failure_response(msg)
+		elif self.isState('follower'):
+			self.send_redirect_response(msg)
+		else:
+			print 'unexpected state type ' + self.state
+
+	def handlePut(self, msg):
+		if self.isState('leader'):
+			## what happens here exactly?
+			self.log.append((self.currentTerm, msg['key'], msg['value']))
+			self.db[msg['key']] = msg['value']
+			self.send_put_response(msg)
+			for peer in self.peers:
+				self.send_append_entries(peer)
+		elif self.isState('candidate'):
+			self.send_failure_response(msg)
+		elif self.isState('follower'):
+			self.send_redirect_response(msg)
+		else:
+			print 'unexpected state type ' + self.state
+
+	def handleRequestVote(self, msg):
+		self.process_request_vote(msg)
+
+	def handleRequestVoteResp(self, msg):
+		if self.isState('leader'):
+			print 'received request_vote_resp while a leader!'
+		elif self.isState('candidate'):
+			self.receive_request_vote_resp(msg)
+		elif self.isState('follower'):
+			print 'received request_vote_resp while a follower!'
+		else:
+			print 'unexpected state type ' + self.state
+
+	def handleAppendEntries(self, msg):
+		if self.isState('leader'):
+			print 'received append_entries while a leader!'
+		else:
+			self.last_received_heartbeat = time.time()
+			self.processAppendEntries(msg)
+
+	def handleAppendEntriesResp(self, msg):
+		if self.isState('leader'):
+			self.receive_append_entries_resp(msg)
+		else:
+			print 'received append_entries_resp while not a leader!'
+
+	def heartbeat(self):
+		if self.isState('leader') and time.time() - self.last_sent_heartbeat > self.heartbeat_timeout:
+			for peer in self.peers:
+				self.send_heartbeat(peer)
+
+	def leader_timeout(self):
+		return self.isState('follower') and time.time() - self.last_received_heartbeat > self.leader_timer
+
+	def election_timeout(self):
+		return self.isState('candidate') and time.time() - self.election_start > self.election_timer
+
+	def start_election(self):
+		self.currentTerm += 1
+		self.votes = [self.ID]
+		self.state = 'candidate'
+		self.election_start = time.time()
+		for peer in self.peers:
+			self.send_request_vote(peer)
+
+	
+	def run(self):
+		## main method
+		while True:
+			if self.leader_timeout():
+				self.start_election()
+			if self.election_timeout():
+				self.start_election()
+
+			ready = select.select([self.sock], [], [], 0.1)[0]
+			if self.sock in ready:
+				msg_raw = self.sock.recv(32768)
+				if len(msg_raw) == 0:
+					continue
+
+				msg = json.loads(msg_raw)
+
+				## handle the message
+				if msg['type'] == 'get':
+					self.handleGet(msg)
+				elif msg['type'] == 'put':
+					self.handlePut(msg)
+				elif msg['type'] == 'request_vote':
+					self.handleRequestVote(msg)
+				elif msg['type'] == 'request_vote_resp':
+					self.handleRequestVoteResp(msg)
+				elif msg['type'] == 'append_entries':
+					self.handleAppendEntries(msg)
+				elif msg['type'] == 'append_entries_resp':
+					self.handleAppendEntriesResp(msg)
+				else:
+					print 'unexpected msg type ' + msg['type']
+
+			self.heartbeat()
+
+if __name__ == "__main__":
+	server = Server(sys.argv[1:])
+	time.sleep(0.5)
+	server.run()
