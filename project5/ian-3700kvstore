@@ -7,8 +7,8 @@ class Server:
 	def __init__(self, args):
 		self.db = {}
 		self.log = []
-		self.prevLogIndexMap = {}
-		self.matchIndexMap = {}
+		self.nextIndex = {}
+		self.matchIndex = {}
 
 		self.commitIndex = 0
 		self.lastApplied = 0
@@ -23,9 +23,6 @@ class Server:
 		self.peers = args[1:]
 		self.num_machines = len(self.peers) + 1
 
-		for peer in self.peers:
-			self.prevLogIndexMap[peer] = 0
-
 		self.last_sent_heartbeat = 0
 		self.last_received_heartbeat = 0
 		self.election_start = 0
@@ -37,6 +34,18 @@ class Server:
 		self.sock = socket.socket(socket.AF_UNIX, socket.SOCK_SEQPACKET)
 		self.sock.connect(self.ID)
 
+	def getLogTermFor(self, index):
+		if index >= len(self.log):
+			return 0
+		else:
+			(term, key, value) = self.log[index]
+			return term
+	def getEntriesToSendFor(self, index):
+		if index >= len(self.log):
+			return []
+		else:
+			return self.log[index:]
+
 	def send_append_entries(self, dst):
 		msg = {}
 		msg['dst'] = dst
@@ -45,11 +54,13 @@ class Server:
 		msg['type'] = 'append_entries'
 
 		msg['term'] = self.currentTerm
-		msg['prevLogIndex'] = self.prevLogIndexFor(dst)
-		msg['prevLogTerm'] = self.log[self.prevLogIndexFor(dst)]
-		msg['entries'] = self.log[self.prevLogIndexFor(dst)+1:]
+		index = self.prevLogIndexFor(dst)
+		msg['prevLogIndex'] = index
+		msg['prevLogTerm'] = self.getLogTermFor(index)
+		msg['entries'] = self.getEntriesToSendFor(index)
 		msg['leaderCommit'] = self.commitIndex
 
+		print str(self.ID) + 'sending out append_entries'
 		self.sock.send(json.dumps(msg))
 
 	def send_heartbeat(self, dst):
@@ -60,14 +71,13 @@ class Server:
 		msg['type'] = 'append_entries'
 
 		msg['term'] = self.currentTerm
-		msg['prevLogIndex'] = self.prevLogIndexFor(dst)
-		if self.prevLogIndexFor(dst) > 0:
-			msg['prevLogTerm'] = self.log[self.prevLogIndexFor(dst)]
-		else:
-			msg['prevLogTerm'] = None
+		index = self.prevLogIndexFor(dst)
+		msg['prevLogIndex'] = index
+		msg['prevLogTerm'] = self.getLogTermFor(index)
 		msg['entries'] = []
 		msg['leaderCommit'] = self.commitIndex
 
+		print str(self.ID) + ' sending out heartbeat'
 		self.sock.send(json.dumps(msg))
 
 	def processAppendEntries(self, msg):
@@ -82,6 +92,7 @@ class Server:
 		else:
 			self.leader = msg['src']
 			resp['leader'] = self.leader
+			self.state = 'follower'
 			self.term = msg['term']
 			resp['term'] = self.term
 			resp['result'] = self.processLogs(msg)
@@ -91,11 +102,13 @@ class Server:
 	def processLogs(self, msg):
 		index = msg['prevLogIndex']
 		term = msg['prevLogTerm']
-		my_term = None if index >= len(self.log) or index < 0 else self.log[index]
+		my_term = 0 if index >= len(self.log) else self.getLogTermFor(index)
 		if my_term != term:
+			self.log = self.log[:index]
+			print 'comparing terms ' + str(term) + ' and ' + str(my_term)
 			return False
 		else:
-			self.log = self.log[:index+1] + msg['entries']
+			self.log = self.log[:index+1] + msg['entries'] if index > 0 else msg['entries']
 			if msg['leaderCommit'] > self.commitIndex:
 				oldIndex = self.commitIndex
 				self.commitIndex = math.min(msg['leaderCommit'], len(self.log) - 1)
@@ -108,7 +121,7 @@ class Server:
 		self.db[key] = value
 
 	def prevLogIndexFor(self, dest):
-		return self.prevLogIndexMap[dest]
+		return max(0, self.nextIndex[dest] - 1)
 
 	def send_request_vote(self, dest):
 		msg = {}
@@ -118,25 +131,24 @@ class Server:
 		msg['type'] = 'request_vote'
 
 		msg['term'] = self.currentTerm
-		msg['lastLogIndex'] = len(self.log)
-		if len(self.log) > 0:
-			(term, key, value) = self.log[len(self.log) - 1]
-			msg['lastLogTerm'] = term
+		msg['lastLogIndex'] = max(0, len(self.log))
+		msg['lastLogTerm'] = self.getLogTermFor(max(0, len(self.log)))
 
 		self.sock.send(json.dumps(msg))
 
 	def winElection(self):
+		print str(self.ID) + ' just became a leader'
 		self.state = 'leader'
 		self.last_sent_heartbeat = time.time()
 		for peer in self.peers:
-			self.prevLogIndexMap[peer] = len(self.log) - 1
+			self.nextIndex[peer] = len(self.log)
 			self.send_heartbeat(peer)
 
 	def process_request_vote(self, msg):
 		resp = {}
 		resp['src'] = self.ID
 		resp['dst'] = msg['src']
-		resp['leader'] = 'FFFF' ## may just be an ignored value instead
+		resp['leader'] = self.leader ## may just be an ignored value instead
 		resp['type'] = 'request_vote_resp'
 
 		if msg['term'] < self.currentTerm:
@@ -185,11 +197,11 @@ class Server:
 		success = msg['result']
 		peer_term = msg['term']
 		if success:
-			self.prevLogIndexMap[msg['src']] = len(self.log) - 1
+			self.nextIndex[msg['src']] = len(self.log)
 		else:
 			## mismatch or bad term
 			if peer_term == self.currentTerm:
-				self.prevLogIndexFor[msg['src']] -= 1
+				self.nextIndex[msg['src']] -= 1
 				self.send_append_entries(msg['src'])
 			else:
 				## they have a newer term.  what happens here?
@@ -261,6 +273,7 @@ class Server:
 			self.log.append((self.currentTerm, msg['key'], msg['value']))
 			self.db[msg['key']] = msg['value']
 			self.send_put_response(msg)
+			self.last_sent_heartbeat = time.time()
 			for peer in self.peers:
 				self.send_append_entries(peer)
 		elif self.isState('candidate'):
@@ -298,6 +311,7 @@ class Server:
 
 	def heartbeat(self):
 		if self.isState('leader') and time.time() - self.last_sent_heartbeat > self.heartbeat_timeout:
+			self.last_sent_heartbeat = time.time()
 			for peer in self.peers:
 				self.send_heartbeat(peer)
 
@@ -308,6 +322,7 @@ class Server:
 		return self.isState('candidate') and time.time() - self.election_start > self.election_timer
 
 	def start_election(self):
+		print str(self.ID) + ' starting an election'
 		self.currentTerm += 1
 		self.votes = [self.ID]
 		self.state = 'candidate'
