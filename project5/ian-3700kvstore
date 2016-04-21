@@ -102,8 +102,8 @@ class Server:
 	def processLogs(self, msg):
 		index = msg['prevLogIndex']
 		term = msg['prevLogTerm']
-		my_term = 0 if index >= len(self.log) else self.getLogTermFor(index)
-		if my_term != term:
+		my_term = 0 if len(self.log) == 0 else self.getLogTermFor(index)
+		if my_term != term and my_term != 0:
 			self.log = self.log[:index]
 			print 'comparing terms ' + str(term) + ' and ' + str(my_term)
 			return False
