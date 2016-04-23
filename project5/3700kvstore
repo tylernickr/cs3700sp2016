@@ -12,27 +12,33 @@ last = 0
 
 class KVStore:
     
-    def __init__(self, id):
+    def __init__(self, id): 
         self.id = id
         self.db = {}
         self.leader = 'FFFF'
         
         self.term = 0
-        self.commits = 0
+        self.index = -1
+        
+        self.log = []
+        
+        self.redirectQueue = []
         
         self.last_heartbeat = time.time()
         self.leader_timeout = .3
         
         self.num_replicas = len(replica_ids) + 1
         
-        self.state = 'follower'
-        
         self.sock = socket.socket(socket.AF_UNIX, socket.SOCK_SEQPACKET)
         self.sock.connect(self.id)
         
     def redirect_to_leader(self, msg):
         to_send = {'src': self.id, 'dst': msg['src'], 'MID': msg['MID'],  'type': 'redirect', 'leader': self.leader}
-        self.sock.send(json.dumps(to_send))
+        if self.leader != 'FFFF':
+            self.sock.send(json.dumps(to_send))
+            #print self.id + ": redirecting " + msg['MID'] + " to " + self.leader
+        else:
+            self.send_failed_response(msg)
                     
     def send_put_to_replicas(self, msg):
         to_send = {'src': self.id, 'dst': 'FFFF', 'type': msg['type'], 'leader': self.id, 'key': msg['key'], 'value': msg['value'], 'MID': msg['MID']}
@@ -41,7 +47,6 @@ class KVStore:
     def send_put_response(self, msg):
         to_send = {'src': self.id, 'dst': msg['src'], 'leader': self.leader, 'type': 'ok', 'MID': msg['MID']}
         self.sock.send(json.dumps(to_send))
-        #print self.id + ": finished sending response to: " + to_send['dst']
         
     def send_get_response(self, msg, value):
         to_send = {'src': self.id, 'dst': msg['src'], 'leader': self.leader, 'type': 'ok', 'MID': msg['MID'], 'value':value}
@@ -51,9 +56,27 @@ class KVStore:
         to_send = {'src': self.id, 'dst': msg['src'], 'leader': self.leader, 'type': 'fail', 'MID': msg['MID']}
         self.sock.send(json.dumps(msg))
         
-    def send_RPC(self):
-        msg = {'src': self.id, 'dst': 'FFFF', 'leader': self.leader, 'type': 'rpc', 'term': self.term}
+    def send_request(self, index):
+        to_send = {'src': self.id, 'dst': self.leader, 'leader': self.leader, 'type': 'request', 'index': index}
+        self.sock.send(json.dumps(to_send))
+        
+    def send_RPC(self): 
+        key = ""
+        value = ""
+        if self.index >= 0:
+            key = self.log[self.index][0]
+            value = self.log[self.index][1]
+        arr = [(key, value)]
+            
+        msg = {'src': self.id, 'dst': 'FFFF', 'leader': self.leader, 'type': 'rpc', 'term': self.term, 'maxindex': self.index, 'index': self.index, 'array': arr}
         self.sock.send(json.dumps(msg))
+        
+    def send_specific_RPC(self, index, dst):
+        num_to_send = self.index - index
+        arr = self.log[index:index + num_to_send + 1]
+        msg = {'src': self.id, 'dst': dst, 'leader': self.leader, 'type': 'rpc', 'term': self.term, 'maxindex': self.index, 'index': index, 'array': arr}
+        self.sock.send(json.dumps(msg))
+        
         
     def send_vote(self, dest):
         msg = {'src': self.id, 'dst': dest, 'leader': dest, 'type': 'vote'}
@@ -61,10 +84,7 @@ class KVStore:
         
     def begin_election(self):
         self.leader_timeout = 2
-        #print self.id + ": is trying to be leader"
         self.leader = 'FFFF'
-        self.state = 'candidate'
-        self.term += 1
         self.send_RPC()
         time_of_last_rpc = time.time()
         votes = [self.id] 
@@ -75,11 +95,6 @@ class KVStore:
                 self.send_RPC()
                 time_of_last_rpc = time.time()
             
-            if time.time() - election_start > election_timeout:
-                #timed out, abort election
-                self.state = 'follower'
-                self.last_heartbeat = time.time()
-                return
                 
             ready = select.select([self.sock], [], [], 0.1)[0]
             if self.sock in ready:
@@ -94,14 +109,10 @@ class KVStore:
                     self.send_failed_response(msg)
                     
                 elif msg['type'] == 'rpc':
-                    #only one case to worry about
                     if msg['leader'] == msg['src']:
-                        #this person has won an election
-                        if msg['term'] >= self.term:
-                            #They're legit, go with them
+                        if msg['term'] > self.term:
                             self.leader = msg['src']
                             self.state = 'follower'
-                            #print self.id + ": lost the election"
                             self.last_heartbeat = time.time()
                             return
                             
@@ -109,20 +120,26 @@ class KVStore:
                     if msg['src'] not in votes:
                         votes.append(msg['src'])
                         
+            if time.time() - election_start > election_timeout:
+                self.last_heartbeat = time.time()
+                return
+                        
         #after winning the election
         self.leader = self.id
+        self.term += 1
         self.state = 'leader'
         self.send_RPC()
         print self.id + " JUST WON THE ELECTION"
-        #for vote in votes:
-           # print vote
+        #for v in votes:
+        #    print v
+        
+        for request in self.redirectQueue:
+            self.send_failed_response(request)
         
     def vote_in_election(self, candidate_id):
         self.leader_timeout = 2
         self.leader = 'FFFF'
-        self.term += 1
         self.send_vote(candidate_id)
-        #print self.id + ": voted for " + candidate_id
         last_voted = time.time()
         while True:
             if time.time() - last_voted > .25:
@@ -143,11 +160,10 @@ class KVStore:
                 elif msg['type'] == 'rpc':
                 
                     if msg['leader'] == msg['src']:
-                        #someone won
                         self.last_heartbeat = time.time()
+                        self.term = msg['term']
                         break
                     elif msg['term'] > self.term:
-                        #apparently a new election started
                         self.vote_in_election(msg['src'])
                         return
                     else:
@@ -163,16 +179,17 @@ class KVStore:
     
     def get(self, key):
         if key in self.db:
-            #print self.id + ": got (" + key + ", " + self.db[key] + ")"
             return self.db[key]
         else:
             return ""
         
     def put(self, key, value):
         self.db[key] = value
-        self.commits += 1
-        #print self.id + ": put (" + key + ", " + value + ")"
         
+    def addToLog(self, key, value):
+        self.log.append((key, value))
+        self.index += 1
+                
     def is_leader(self):
         return self.id == self.leader
         
@@ -182,7 +199,6 @@ time.sleep(.5)
 kvstore.last_heartbeat = time.time()
 while True:
     if kvstore.time_to_elect_new_leader():
-        #print kvstore.id + "starting election"
         kvstore.begin_election()
         continue
         
@@ -196,50 +212,76 @@ while True:
             
         msg = json.loads(msg_raw)
         
-        # For now, ignore get() and put() from clients
         if msg['type'] == 'get':
             if kvstore.is_leader():
                 value = kvstore.get(msg['key'])
                 kvstore.send_get_response(msg, value)
             else:
-                kvstore.redirect_to_leader(msg)
+                kvstore.redirectQueue.append(msg)
+                #kvstore.redirect_to_leader(msg)
         
         elif msg['type'] == 'put':
-            if msg['src'] == kvstore.id:
-                pass
                 
             if kvstore.is_leader():
+                kvstore.addToLog(msg['key'], msg['value'])
                 kvstore.put(msg['key'], msg['value'])
-                #print "leader put msg: " + msg['MID'] + " sent from: " + msg['src']
-                kvstore.send_put_to_replicas(msg)
+                kvstore.send_RPC()
                 kvstore.send_put_response(msg)
+                
             else:
-                kvstore.redirect_to_leader(msg)
-                    
-            
+                kvstore.redirectQueue.append(msg)
+                #kvstore.redirect_to_leader(msg)
+                
+        
+        elif msg['type'] == 'request':
+            if kvstore.is_leader():
+                kvstore.send_specific_RPC(msg['index'], msg['src'])
             
         elif msg['type'] == 'rpc':
             if msg['leader'] == msg['src']:
-                #this person claims to have won an election
+                
                 if msg['leader'] != kvstore.leader:
-                    #woah! something is weird here, start new election
-                    #kvstore.begin_election()
                     if msg['term'] > kvstore.term:
                         kvstore.leader = msg['leader']
                         kvstore.term = msg['term']
-                    continue
-                else:
-                    #heartbeat from expected leader
-                    kvstore.last_heartbeat = time.time()
+                
+                
+                
+                elif msg['term'] == kvstore.term:
+                    for redirect in kvstore.redirectQueue:
+                        kvstore.redirect_to_leader(redirect)
+                    kvstore.redirectQueue = []
                     
+                    kvstore.last_heartbeat = time.time()
+                    index = msg['index']
+                    maxIndex = msg['maxindex']
+                    
+                    arr = msg['array']
+                    
+                    if index == kvstore.index:
+                        pass
+                    elif index == kvstore.index + 1:
+                        for key, value in arr:
+                            kvstore.addToLog(key, value)
+                            kvstore.put(key, value)
+                        if kvstore.index != maxIndex:
+                            kvstore.send_request(kvstore.index + 1)
+                        
+                    elif index > kvstore.index + 1:
+                        kvstore.send_request(kvstore.index + 1)
+                        print kvstore.id + ": " + str(kvstore.index) + ", " + str(index)
+                    else:
+                        #print msg['src'] + " " + str(msg['index']) + " Something weird is happening " + kvstore.id + " " + str(kvstore.index)
+                        pass
             else:
-                kvstore.vote_in_election(msg['src'])
-                continue
+                if msg['index'] >= kvstore.index and msg['term'] >= kvstore.term:
+                    #print kvstore.id + ":" + str(kvstore.index) + ", " + msg['src'] + ":" + str(msg['index'])
+                    kvstore.vote_in_election(msg['src'])
+                    continue
                 
         
     clock = time.time()
-    if clock - last > .5 and kvstore.leader == kvstore.id:
-        #print kvstore.id + ": sending leader heartbeat"
+    if clock - last > .2 and kvstore.leader == kvstore.id:
         kvstore.send_RPC()
         last = clock
         
