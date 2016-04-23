@@ -18,16 +18,21 @@ class KVStore:
         self.leader = 'FFFF'
         
         self.term = 0
-        self.index = -1
+        self.logIndex = -1
+        self.commitedIndex = -1
         
         self.log = []
         
         self.redirectQueue = []
+        self.pendingRequests = []
         
         self.last_heartbeat = time.time()
         self.leader_timeout = .3
         
         self.num_replicas = len(replica_ids) + 1
+        self.replicaCommits = {}
+        for id in replica_ids:
+            self.replicaCommits[id] = -1
         
         self.sock = socket.socket(socket.AF_UNIX, socket.SOCK_SEQPACKET)
         self.sock.connect(self.id)
@@ -39,10 +44,6 @@ class KVStore:
             #print self.id + ": redirecting " + msg['MID'] + " to " + self.leader
         else:
             self.send_failed_response(msg)
-                    
-    def send_put_to_replicas(self, msg):
-        to_send = {'src': self.id, 'dst': 'FFFF', 'type': msg['type'], 'leader': self.id, 'key': msg['key'], 'value': msg['value'], 'MID': msg['MID']}
-        self.sock.send(json.dumps(to_send))
         
     def send_put_response(self, msg):
         to_send = {'src': self.id, 'dst': msg['src'], 'leader': self.leader, 'type': 'ok', 'MID': msg['MID']}
@@ -56,26 +57,19 @@ class KVStore:
         to_send = {'src': self.id, 'dst': msg['src'], 'leader': self.leader, 'type': 'fail', 'MID': msg['MID']}
         self.sock.send(json.dumps(msg))
         
-    def send_request(self, index):
-        to_send = {'src': self.id, 'dst': self.leader, 'leader': self.leader, 'type': 'request', 'index': index}
+    def send_request(self):
+        to_send = {'src': self.id, 'dst': self.leader, 'leader': self.leader, 'type': 'request', 'logIndex': self.logIndex, 'commitedIndex': self.commitedIndex}
         self.sock.send(json.dumps(to_send))
         
-    def send_RPC(self): 
-        key = ""
-        value = ""
-        if self.index >= 0:
-            key = self.log[self.index][0]
-            value = self.log[self.index][1]
-        arr = [(key, value)]
-            
-        msg = {'src': self.id, 'dst': 'FFFF', 'leader': self.leader, 'type': 'rpc', 'term': self.term, 'maxindex': self.index, 'index': self.index, 'array': arr}
+    def send_RPC(self):
+        arr = self.log[self.commitedIndex + 1:]
+        msg = {'src': self.id, 'dst': 'FFFF', 'leader': self.leader, 'type': 'rpc', 'term': self.term, 'logIndex': self.logIndex, 'commitedIndex': self.commitedIndex, 'array': arr}
         self.sock.send(json.dumps(msg))
         
-    def send_specific_RPC(self, index, dst):
-        num_to_send = self.index - index
-        arr = self.log[index:index + num_to_send + 1]
-        msg = {'src': self.id, 'dst': dst, 'leader': self.leader, 'type': 'rpc', 'term': self.term, 'maxindex': self.index, 'index': index, 'array': arr}
-        self.sock.send(json.dumps(msg))
+    def send_specific_RPC(self, msg):
+        arr = self.log[msg['logIndex'] + 1:]
+        to_send = {'src': self.id, 'dst': msg['src'], 'leader': self.leader, 'type': 'rpc', 'term': self.term, 'logIndex': self.logIndex, 'commitedIndex': msg['logIndex'], 'array': arr}
+        self.sock.send(json.dumps(to_send))
         
         
     def send_vote(self, dest):
@@ -185,10 +179,11 @@ class KVStore:
         
     def put(self, key, value):
         self.db[key] = value
+        self.commitedIndex += 1
         
     def addToLog(self, key, value):
         self.log.append((key, value))
-        self.index += 1
+        self.logIndex += 1
                 
     def is_leader(self):
         return self.id == self.leader
@@ -218,24 +213,46 @@ while True:
                 kvstore.send_get_response(msg, value)
             else:
                 kvstore.redirectQueue.append(msg)
-                #kvstore.redirect_to_leader(msg)
         
         elif msg['type'] == 'put':
                 
             if kvstore.is_leader():
                 kvstore.addToLog(msg['key'], msg['value'])
-                kvstore.put(msg['key'], msg['value'])
+                kvstore.pendingRequests.append(msg)
                 kvstore.send_RPC()
-                kvstore.send_put_response(msg)
                 
             else:
                 kvstore.redirectQueue.append(msg)
-                #kvstore.redirect_to_leader(msg)
                 
         
         elif msg['type'] == 'request':
             if kvstore.is_leader():
-                kvstore.send_specific_RPC(msg['index'], msg['src'])
+                if msg['logIndex'] < kvstore.commitedIndex:
+                    kvstore.send_specific_RPC(msg)
+                    
+                else:
+                    kvstore.replicaCommits[msg['src']] = msg['logIndex']
+                    print kvstore.replicaCommits
+                
+                    commitIndexes = []
+                    for key in kvstore.replicaCommits:
+                        commitIndexes.append(kvstore.replicaCommits[key])
+                    while len(commitIndexes) > math.ceil(kvstore.num_replicas / 2.0) - 1:
+                        commitIndexes.remove(min(commitIndexes))
+                        
+                    num_to_commit = min(commitIndexes) - kvstore.commitedIndex
+                    
+                    if num_to_commit > 0:
+                        log_to_commit = kvstore.log[kvstore.commitedIndex + 1:kvstore.commitedIndex + num_to_commit + 1]
+                        puts_to_respond_to = kvstore.pendingRequests[:num_to_commit]
+                        
+                        for key, value in log_to_commit:
+                            kvstore.put(key, value)
+                            
+                        for request in puts_to_respond_to:
+                            kvstore.send_put_response(request)
+                        kvstore.pendingRequests = kvstore.pendingRequests[num_to_commit:]
+                        
             
         elif msg['type'] == 'rpc':
             if msg['leader'] == msg['src']:
@@ -245,43 +262,39 @@ while True:
                         kvstore.leader = msg['leader']
                         kvstore.term = msg['term']
                 
-                
-                
                 elif msg['term'] == kvstore.term:
                     for redirect in kvstore.redirectQueue:
                         kvstore.redirect_to_leader(redirect)
                     kvstore.redirectQueue = []
                     
                     kvstore.last_heartbeat = time.time()
-                    index = msg['index']
-                    maxIndex = msg['maxindex']
-                    
+                    commitedIndex = msg['commitedIndex']
+                    logIndex = msg['logIndex']
                     arr = msg['array']
                     
-                    if index == kvstore.index:
-                        pass
-                    elif index == kvstore.index + 1:
-                        for key, value in arr:
-                            kvstore.addToLog(key, value)
-                            kvstore.put(key, value)
-                        if kvstore.index != maxIndex:
-                            kvstore.send_request(kvstore.index + 1)
+                    
+                    
+                    if logIndex - len(arr) > kvstore.logIndex:
+                        kvstore.send_request()
                         
-                    elif index > kvstore.index + 1:
-                        kvstore.send_request(kvstore.index + 1)
-                        print kvstore.id + ": " + str(kvstore.index) + ", " + str(index)
                     else:
-                        #print msg['src'] + " " + str(msg['index']) + " Something weird is happening " + kvstore.id + " " + str(kvstore.index)
-                        pass
+                        for key, value in arr[kvstore.logIndex - logIndex:]:
+                            kvstore.addToLog(key, value)
+                        
+                        for key, value in kvstore.log[kvstore.commitedIndex + 1:]:
+                            kvstore.put(key, value)
+                            
+                        kvstore.send_request()
+                        
             else:
-                if msg['index'] >= kvstore.index and msg['term'] >= kvstore.term:
+                if msg['logIndex'] >= kvstore.logIndex and msg['term'] >= kvstore.term:
                     #print kvstore.id + ":" + str(kvstore.index) + ", " + msg['src'] + ":" + str(msg['index'])
                     kvstore.vote_in_election(msg['src'])
                     continue
                 
         
     clock = time.time()
-    if clock - last > .2 and kvstore.leader == kvstore.id:
+    if clock - last > .1 and kvstore.leader == kvstore.id:
         kvstore.send_RPC()
         last = clock
         
